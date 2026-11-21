@@ -1,6 +1,8 @@
-# gaudi2-glm-5.3-flash
+# GLM-5.3-Flash on Intel Gaudi 2 with vLLM (FP8, 524K Context)
 
-Build and serving recipes for GLM-5.3-Flash (FP8, abliterated variant) on 8x Intel Gaudi 2, run as two TP4 vLLM replicas.
+`gaudi2-glm-5.3-flash` · [all Gaudi 2 recipes](https://github.com/LiquidLava1990)
+
+Build and serving recipes for GLM-5.3-Flash (FP8, abliterated variant) on 8x Intel Gaudi 2, run as two TP4 vLLM replicas. This is the production setup: 524,288-token context, 10.76 tok/s per agent with 16 concurrent agents per replica, and host-RAM KV cache offload. It is a working example of serving a large mixture-of-experts LLM on Habana Gaudi HPUs.
 
 ## Status
 
