@@ -1,0 +1,192 @@
+"""Step 5's flag-off accept: with every new flag off, runner, q4kv and the step dispatch decide as base 1481bb99 does, on the metadata
+set recorded from r0's own step stats (fixtures/recorded_metadata_r0.json). The scheduler differential is test_miss_attrib.py's."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import key_stack  # noqa: E402
+from overlay_testlib import BASE_ROOT, OVERLAY_ROOT, load_overlay  # noqa: E402
+from test_c789_cases import configured, runner_class  # noqa: E402
+
+RUNNER_FILE = "vllm_gaudi/v1/worker/hpu_model_runner.py"
+RECORDED = Path(__file__).resolve().parent / "fixtures" / "recorded_metadata_r0.json"
+BLOCK = 128
+INDEXER_FILE = "vllm_gaudi/ops/hpu_glm5next_sparse_indexer.py"
+KDA_FILE = "vllm_gaudi/ops/hpu_glm5next_kda.py"
+# The exact AST delta from base 1481bb99, per file: qualified function name -> first 16 hex of the sha256 of the overlay function's ast.dump.
+# A name list let any edit to an allowed function pass; a pin fails on any change to it, so a change here is read in the diff and re-pinned.
+# Runner: dual-4m's opt-in 640 tier (off in the flag-off env) and step 29's keyed boot and decode lattice, whose hooks are identity with
+# their flags unset (test_decode_lattice.py: LatticeSpec, WarmupOrder, DummyLengths, Metadata). Step 7's restore fence adds _update_states and
+# one line of _execute_model_generic, both inert with HPU_GLM53_GRAPHS_ONLY unset (test_restore_fence.py: FlagOff).
+PINNED_DELTAS = {
+    RUNNER_FILE: {
+        "HPUAttentionMetadataProcessor.process_metadata": "daee58b279ca84cd",
+        "HPUModelRunner._create_decode_input_data": "cafdd58cd1ba00b3",
+        "HPUModelRunner._execute_model_generic": "b7862efaa372a282",
+        "HPUModelRunner._glm53_sparse_block_bucket": "87cbcb7f62ccf14b",
+        "HPUModelRunner._make_glm53_sparse_metadata_cpu": "35878a0c4ce4c638",
+        "HPUModelRunner._prepare_dummy_scenario": "517fc7fde7e5b34a",
+        "HPUModelRunner._update_states": "5a3258131adf46ae",
+        "HPUModelRunner.warmup_model": "c9f8dc677a12f1ee",
+        "_glm53_warmup_only_kpool_cap": "edf91c4a9c615949",
+    },
+    KDA_FILE: {"_r589_original_chunk_kda": "ccb2d6fb1f6c0f31"},
+    # forward: key_capture_active gates the warmup scan cap; _write_topk: R6's capture-time reads of the dummy's sequence length and scan bucket.
+    INDEXER_FILE: {
+        "HPUGlm5NextSparseIndexerOp._write_topk": "d1d0c09b0e673478",
+        "HPUGlm5NextSparseIndexerOp.forward": "ef601d11befadc30",
+    },
+}
+
+NEW_FLAGS = ("VLLM_GAUDI_MIXED_PROMPT_KEYS", "HPU_GLM53_R589_CAPTURE_MARKS", "HPU_GLM53_PROMPT_KEY_MERGE_CHECK")
+OFF_ENV = {"HPU_GLM53_SPARSE_DECODE_BLOCK_TIER_640": "0", "HPU_GLM53_SPARSE_PREFILL_BLOCK_TIER_640": "0"}
+
+
+def definitions(path: Path) -> dict[str, str]:
+    """Every function's AST, by qualified name, without line numbers."""
+    found: dict[str, str] = {}
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = f"{prefix}{child.name}"
+                if not isinstance(child, ast.ClassDef):
+                    found[name] = ast.dump(child)
+                walk(child, name + ".")
+            else:
+                walk(child, prefix)
+
+    walk(ast.parse(path.read_text(encoding="utf-8")), "")
+    return found
+
+
+def changed_definitions(relative: str) -> set[str]:
+    base, overlay = definitions(BASE_ROOT / relative), definitions(OVERLAY_ROOT / relative)
+    return {name for name in base.keys() | overlay.keys() if base.get(name) != overlay.get(name)}
+
+
+def pinned_delta(relative: str) -> dict[str, str]:
+    """Qualified name -> digest of the overlay's AST for every function that differs from base; a function the overlay removed reads 'removed'."""
+    overlay = definitions(OVERLAY_ROOT / relative)
+    return {name: hashlib.sha256(overlay[name].encode()).hexdigest()[:16] if name in overlay else "removed"
+            for name in sorted(changed_definitions(relative))}
+
+
+def recorded() -> list[dict[str, int | str]]:
+    return json.loads(RECORDED.read_text(encoding="utf-8"))
+
+
+class RunnerOffEqualsBase(unittest.TestCase):
+    def test_the_runner_differs_from_base_by_exactly_the_pinned_functions(self) -> None:
+        self.assertEqual(pinned_delta(RUNNER_FILE), PINNED_DELTAS[RUNNER_FILE])
+
+    def test_recorded_metadata_set_is_real_and_big_enough(self) -> None:
+        rows = recorded()
+        self.assertGreater(len(rows), 20)
+        self.assertEqual({row["kind"] for row in rows}, {"prompt", "decode"})
+
+    def test_every_recorded_shape_builds_the_same_metadata(self) -> None:
+        base, overlay = runner_class(BASE_ROOT / RUNNER_FILE), runner_class(OVERLAY_ROOT / RUNNER_FILE)
+        with mock.patch.dict(os.environ, OFF_ENV):
+            for row in recorded():
+                with self.subTest(row=row):
+                    rows, start = int(row["rows"]), max(int(row["start"]), 0)
+                    decode = {"is_decode": True} if row["kind"] == "decode" else {}
+                    inputs = (["0"], [rows], [list(range(start, start + rows))], 1, rows)
+                    old = configured(base, BLOCK, 4)._make_glm53_sparse_metadata_cpu(*inputs)
+                    new = configured(overlay, BLOCK, 4)._make_glm53_sparse_metadata_cpu(*inputs, **decode)
+                    self.assertEqual(old[4], new[4])
+                    for before, after in zip(old[:4], new[:4]):
+                        self.assertTrue(torch.equal(before, after))
+
+
+class LayerOffEqualsBase(unittest.TestCase):
+    """The real indexer, kpool, Q4 and R589 outside a capture: the same fences, in the same order, with the same top-k."""
+
+    def run_layer(self, root: Path, rows: int, columns: int, start: int) -> tuple:
+        with key_stack.layer_stack(root) as world:
+            world.kpool._score_pool_chunk = key_stack.fast_scores
+            physical = key_stack.indexer_step(world, key_stack.prompt_case(rows, columns, start))
+            key_stack.q4_fetch_step(world, physical, columns)
+            key_stack.kda_step(world, rows)
+            return [(site.split(":")[0], sync) for site, sync in world.tally.calls], physical
+
+    def test_recorded_prompt_shapes_fence_and_select_alike(self) -> None:
+        shapes = {(int(row["rows"]), key_stack_width(int(row["rows"]) + max(int(row["start"]), 0)))
+                  for row in recorded() if row["kind"] == "prompt"}
+        checked = sorted(shape for shape in shapes if 1 <= shape[0] <= 2048 and shape[1] <= 4096)[:6]
+        self.assertTrue(checked)
+        for rows, columns in checked:
+            with self.subTest(rows=rows, columns=columns):
+                old_fences, old_top = self.run_layer(BASE_ROOT, rows, columns, 0)
+                new_fences, new_top = self.run_layer(OVERLAY_ROOT, rows, columns, 0)
+                self.assertEqual(old_fences, new_fences)
+                self.assertTrue(torch.equal(old_top, new_top))
+
+
+def key_stack_width(tokens: int) -> int:
+    blocks, width = (tokens + BLOCK - 1) // BLOCK, 1
+    while width < blocks:
+        width *= 2
+    return width
+
+
+class DispatchOffEqualsBase(unittest.TestCase):
+    def setUp(self) -> None:
+        for flag in NEW_FLAGS:
+            self.assertNotIn(flag, os.environ)
+        self.graph = load_overlay("glm53_mixed_graph.py")
+
+    def test_new_readers_read_off_with_no_environment(self) -> None:
+        self.assertEqual(self.graph.prompt_keys(), ())
+        self.assertFalse(self.graph.capture_marks_enabled())
+        self.assertFalse(self.graph.merge_check_enabled())
+        self.assertFalse(self.graph.key_capture_active())
+        self.assertFalse(self.graph.capture_tile_marks())
+        self.assertTrue(self.graph.lazy_fence_sync())
+
+    def test_install_entry_is_a_no_op_with_every_flag_off(self) -> None:
+        adapter = SimpleNamespace()
+        self.graph.install_entry(adapter, lambda: None)
+        self.assertEqual(vars(adapter), {})
+
+    def test_the_fence_outside_a_capture_is_the_literal_it_replaced(self) -> None:
+        calls: list[dict] = []
+        self.graph.lazy_fence(SimpleNamespace(mark_step=lambda **kwargs: calls.append(kwargs)))
+        self.assertEqual(calls, [{"sync": True}])
+
+    def test_prepare_returns_the_runner_forward_with_step_off(self) -> None:
+        with mock.patch.dict(sys.modules, {"glm53_mixed_graph": self.graph}):
+            step = load_overlay("glm53_mixed_step.py")
+            runner = SimpleNamespace(_execute_model_generic="generic")
+            self.assertEqual(step.prepare(runner, None, SimpleNamespace(prompt_req_ids=["a"], decode_req_ids=[]), None, None), "generic")
+
+
+class FilesEveryFlagOffTouches(unittest.TestCase):
+    def test_kda_differs_from_base_by_exactly_the_pinned_function(self) -> None:
+        self.assertEqual(pinned_delta(KDA_FILE), PINNED_DELTAS[KDA_FILE])
+
+    def test_the_indexer_differs_from_base_by_exactly_the_pinned_functions(self) -> None:
+        self.assertEqual(pinned_delta(INDEXER_FILE), PINNED_DELTAS[INDEXER_FILE])
+
+    def test_q4kv_changes_since_step_21_are_the_fence_and_the_witness(self) -> None:
+        relative = "vllm_gaudi/ops/hpu_glm5next_q4kv.py"
+        overlay = (OVERLAY_ROOT / relative).read_text(encoding="utf-8")
+        self.assertIn("lazy_fence(htcore)", overlay)
+        self.assertIn('witness_lever("mla_unpack")', overlay)
+
+
+if __name__ == "__main__":
+    unittest.main()

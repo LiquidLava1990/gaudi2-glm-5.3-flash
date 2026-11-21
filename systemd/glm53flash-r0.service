@@ -1,0 +1,36 @@
+[Unit]
+Description=Frozen-manifest GLM-5.3 Flash replica R0 supervisor
+BindsTo=docker.service
+PartOf=docker.service glm53flash-production.target
+Requires=trident-gaudi-ready.service trident-fast-fabric-gaudi.service
+After=docker.service network-online.target trident-gaudi-ready.service trident-fast-fabric-gaudi.service
+Wants=network-online.target
+RequiresMountsFor=/mnt/data1 /mnt/fastmodels
+Before=trident-gaudi-capacity-attestor-r0.service
+StartLimitIntervalSec=30min
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=<USER>
+Group=<GROUP>
+SupplementaryGroups=docker
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HABANA_LOGS=/tmp
+ExecStart=/usr/bin/python3 $HOME/AI/experiments/glm53flash-gaudi-20260826/deploy/systemd-r483/glm53flash_runtime.py supervise --manifest $HOME/AI/experiments/glm53flash-gaudi-20260826/deploy/systemd-r483/manifest-r0.json
+TimeoutStartSec=25min
+TimeoutStopSec=120
+WatchdogSec=2min
+KillSignal=SIGTERM
+KillMode=process
+Restart=on-failure
+RestartSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+
+[Install]
+WantedBy=glm53flash-production.target
