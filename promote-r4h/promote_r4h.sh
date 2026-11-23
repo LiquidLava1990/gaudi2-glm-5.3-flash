@@ -9,6 +9,8 @@
 # usage: promote_r4h.sh stage --image $CHAMPION_REPO:<date>-<CUT> --image-sha <sha256:...> --levers <file> --gates <file>
 #        (writes champion.staged: the image, the levers file and the launcher's gate settings, each pinned by sha)
 #        setsid nohup ./promote_r4h.sh [--dry-run] </dev/null >/dev/null 2>&1 &   log: logs/promote_r4h-latest.log
+# Only for an r4f -> champion promotion: with a champion already serving under its cut, check_port_owner refuses (nothing is
+# stopped). To take over replicas that already serve the staged image, adopt them instead: adopt_check.sh (RUNBOOK.md).
 set -euo pipefail
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=rollback_r4f.sh
@@ -37,7 +39,7 @@ stage() {  # --image TAG --image-sha SHA --levers FILE --gates FILE: pin all fou
     log "STAGED $(tr '\n' ' ' < "$STAGED")"
 }
 
-promote_preflight() {
+staged_pins_ok() {  # champion.staged names a cut, its tag is still the pinned image, levers and gates are the pinned bytes and agree
     [ -f "$STAGED" ] || refuse "$STAGED is missing: run promote_r4h.sh stage first"
     [ -n "$CHAMPION_CUT" ] || refuse "$STAGED names no CHAMPION_CUT: re-run promote_r4h.sh stage --image ..."
     [ "$($DOCKER image inspect -f '{{.Id}}' "$(staged_value CHAMPION_IMAGE)" 2>/dev/null || true)" = "$(staged_value CHAMPION_IMAGE_SHA)" ] \
@@ -49,6 +51,10 @@ promote_preflight() {
             || refuse "$(staged_value "CHAMPION_$pinned") is not the staged $(staged_value "CHAMPION_${pinned}_SHA" | cut -c1-8)"
     done
     check_pin_agreement
+}
+
+promote_preflight() {
+    staged_pins_ok
     [ -f "$CHAMPION_SERVE" ] || refuse "$CHAMPION_SERVE is missing"
     rollback_preflight   # the rollback must be able to run before anything changes
     local role

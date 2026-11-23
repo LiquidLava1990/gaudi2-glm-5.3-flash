@@ -1,0 +1,7 @@
+# base files from image claude-flash-dual-graphs-c1d:20261112-r4h8 (8bf1872d93c1), path under /usr/local/lib/python3.12/dist-packages/
+# glm53_attn_pin.pth is listed because the base already carries these exact bytes; the overlay copy is identical.
+989df2fdfa9fbfdb82a8c455a6415616173563b043d202a6cd48c33d452c8414  glm53_attn_pin.py
+8b1ba6978604e460796e5b71988652eeb243f1f2071caa60d04595d051575158  glm53_attn_pin.pth
+6ab2cd1b5c960978fa582c119d9ce43777b1f0d999ae33e350276968d26a7d61  glm53_mixed_graph.py
+299b209f0081fef8629ac0f2b4b7839fa15eedbd85de502cf2b6edc214c4ff5b  glm53_hbm_margin.py
+3fcb254707962df8957e6af91cfe8218cbb66324977447bf51ac278611174dd7  vllm_gaudi/v1/worker/hpu_worker.py

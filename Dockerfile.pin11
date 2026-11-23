@@ -1,0 +1,11 @@
+# claude-flash-dual-graphs-c1d r4h8-pin11: the 2026-11-12 r4h8 champion image plus the five overlay-pin11/ files
+# (attention pin, mixed-graph and HBM-margin headroom levers, hpu_worker breadcrumbs), base files hash-verified.
+# Build with ./build_pin11.sh (it checks the base id, protects the champion images and runs the pin suites). By hand:
+#   docker build -f Dockerfile.pin11 -t claude-flash-dual-graphs-c1d:<date>-pin11-r4h8 .   (.dockerignore keeps the tests out)
+# The dist-packages bytes match the production image 0e5df6b75e7a; the image id differs (this adds /opt/pin11-overlay and labels).
+ARG BASE_IMAGE=sha256:8bf1872d93c199fef9da428ed473c74be8736a695406f6d9666ae572e0d29e8b
+FROM ${BASE_IMAGE}
+COPY install_overlay.sh /opt/pin11-overlay/install_overlay.sh
+COPY overlay-pin11/ /opt/pin11-overlay/src/
+RUN bash /opt/pin11-overlay/install_overlay.sh /opt/pin11-overlay/src /usr/local/lib/python3.12/dist-packages /opt/pin11-overlay 20261112-r4h8
+LABEL claude.flash.pin11="20261112-r4h8 (8bf1872d93c1) + overlay-pin11 (attn pin, headroom levers, serial key-workspace release, breadcrumbs)"

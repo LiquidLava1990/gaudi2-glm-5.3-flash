@@ -40,7 +40,9 @@ CHAMPION_FINAL_ENV_SHA="$(sed -n 's/^CHAMPION_FINAL_ENV_SHA=//p' "$STAGED_FILE")
 echo "$CHAMPION_FINAL_ENV_SHA  $FINAL_ENV" | sha256sum --quiet -c - 2> /dev/null \
     || { echo "HALT serve_champion.sh: FINAL_ENV=$FINAL_ENV is not the staged ${CHAMPION_FINAL_ENV_SHA:0:8}: export FINAL_ENV=$CHAMPION_FINAL_ENV" >&2; exit 2; }
 export FINAL_ENV
-export PORT_A=18274 PORT_B=18275 LAB_HOST=0.0.0.0 LAB_SERVE_PROD=1 LABPY="$L/lab_serve.py"
+export C1D_KV_BLOCKS=30880 PORT_A=18274 PORT_B=18275 LAB_HOST=0.0.0.0 LAB_SERVE_PROD=1 LABPY="$L/lab_serve_seeded.py"
+# LAB_RECIPE_SEED_LEAF is inherited, never set here: champion_boot.sh exports the leaf the last serving boot of the staged image
+# recorded (or keeps the caller's own); unset, the launcher boots a fresh empty leaf exactly as the stock chain does.
 export R4E_IMAGE="$CHAMPION_IMAGE" R4E_IMAGE_SHA="$CHAMPION_IMAGE_SHA"
 export R4E_GATES_OVERRIDE="$CHAMPION_GATES" R4E_LEVERS_ENV="$CHAMPION_LEVERS"
 export R4E_ARM="champion-$ROLE"

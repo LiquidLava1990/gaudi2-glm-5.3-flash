@@ -22,7 +22,7 @@ WAIT_LIMIT_S=2400      # how long a launcher run may take to print SERVING or DO
 HOLDER_WAIT_S=120      # a released quad holder exits within its 5 s poll
 
 # Test hooks: only with GLM53_PROMOTE_TEST=1 (dry runs and CPU tests); a leftover hook in a real run refuses.
-TEST_HOOKS=(UNIT_DIR SERVE_SCRIPT CHAMPION_SERVE SMOKE_SCRIPT QUEUE_DIR DOCKER SUDO SYSTEMCTL CURL SS POLL_S HOLDER_DIR STAGED)
+TEST_HOOKS=(UNIT_DIR SERVE_SCRIPT CHAMPION_SERVE SMOKE_SCRIPT QUEUE_DIR DOCKER SUDO SYSTEMCTL CURL SS POLL_S HOLDER_DIR STAGED PROC_ROOT TASKSET)
 for hook in "${TEST_HOOKS[@]}"; do
     [ -z "${!hook+x}" ] || [ "${GLM53_PROMOTE_TEST:-0}" = 1 ] \
         || { echo "REFUSED: test hook $hook is set without GLM53_PROMOTE_TEST=1; unset it for a real run" >&2; exit 2; }
@@ -40,6 +40,8 @@ SS=${SS:-ss}
 POLL_S=${POLL_S:-15}
 HOLDER_DIR=${HOLDER_DIR:-/tmp}
 STAGED=${STAGED:-$KIT_DIR/champion.staged}
+PROC_ROOT=${PROC_ROOT:-/proc}
+TASKSET=${TASKSET:-taskset}
 # the champion is a parameter: promote_r4h.sh stage --image <repo:tag-CUT> writes CHAMPION_CUT; unstaged = empty (no champion
 # container to stop on rollback, and promote refuses)
 CHAMPION_CUT=$(sed -n 's/^CHAMPION_CUT=//p' "$STAGED" 2>/dev/null || true)
@@ -121,6 +123,40 @@ launch_and_wait() {  # $1 script, $2 role, $3 run dir name: run it in its own se
         sleep "$POLL_S"
     done
     log "WAIT_TIMEOUT $2 after ${WAIT_LIMIT_S}s" >&2; return 1
+}
+
+# AccThreadPool pins (2026-11-22): each of a replica's 4 worker processes has one thread named AccThreadPool that spins a core.
+# After every boot that serves they get one cpu each, in ascending tid order, on the replica's own socket (r1 socket 0, r0 socket 1).
+declare -A ACC_CPU_FIRST=([r0]=50 [r1]=14)
+ACC_THREADS=4
+
+acc_thread_tids() {  # $1 container: the tids of its AccThreadPool threads, ascending (only its own processes are walked)
+    local pid task
+    $DOCKER top "$1" -eo pid 2>/dev/null | tail -n +2 | while read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        for task in "$PROC_ROOT/$pid"/task/*; do
+            if [ "$(cat "$task/comm" 2>/dev/null)" = AccThreadPool ]; then echo "${task##*/}"; fi
+        done
+    done | sort -n
+}
+
+pin_acc_threads() {  # $1 role: one cpu each for its container's AccThreadPool threads; prints its lines (the caller stamps them).
+    local role="$1" name tid cpu pinned=0 tids=()   # rc 1 when not exactly ACC_THREADS were found (nothing pinned) or a pin failed
+    [ -n "${ACC_CPU_FIRST[$role]:-}" ] || { echo "ACC_PIN_WARN role=$role has no cpus in ACC_CPU_FIRST (common.sh); nothing pinned"; return 1; }
+    name=$(lab_name "$role" "$CHAMPION_CUT")
+    mapfile -t tids < <(acc_thread_tids "$name")
+    if [ "${#tids[@]}" -ne "$ACC_THREADS" ]; then
+        echo "ACC_PIN_WARN role=$role found ${#tids[@]} AccThreadPool threads in $name, expected $ACC_THREADS; nothing pinned (once it serves, rerun: champion_boot.sh $role --pin-acc)"
+        return 1
+    fi
+    cpu=${ACC_CPU_FIRST[$role]}
+    for tid in "${tids[@]}"; do
+        if $SUDO $TASKSET -pc "$cpu" "$tid" > /dev/null; then echo "ACC_PIN role=$role tid=$tid cpu=$cpu"; pinned=$((pinned + 1))
+        else echo "ACC_PIN_WARN role=$role tid=$tid cpu=$cpu: taskset failed (the threads are root's: it needs sudo -n taskset)"; fi
+        cpu=$((cpu + 1))
+    done
+    echo "ACC_PIN_DONE role=$role container=$name pinned=$pinned/$ACC_THREADS cpus=${ACC_CPU_FIRST[$role]}-$((cpu - 1))"
+    [ "$pinned" -eq "$ACC_THREADS" ]
 }
 
 health_and_smoke() {  # $1 role

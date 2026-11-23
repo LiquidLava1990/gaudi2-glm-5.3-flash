@@ -7,6 +7,11 @@
 #        champion_boot.sh r0|r1 --plan      print what a start would do, change nothing
 #        champion_boot.sh r0|r1 --stop      take the replica down on purpose: docker stop, free its quad; it stays down
 #        champion_boot.sh r0|r1 --recover   restart the replica if it went down by itself (silent when there is nothing to do)
+#        champion_boot.sh r0|r1 --pin-acc   re-apply the AccThreadPool cpu pins of the running replica only (common.sh pin_acc_threads)
+#        champion_boot.sh r0|r1 --keep-seed copy the running replica's recipe leaf to its protected seed copy now (idle IO; no boot)
+# A boot is seeded from the recipe leaf the last serving boot of the same staged image recorded (either role; recipe-seed-<sha12>.leaf
+# in the queue folder); that leaf gone (lab.py down removes it), the boot is seeded from the protected copy the serving boot kept
+# (recipe_cache/seed-<sha12>); neither, a fresh empty leaf. LAB_RECIPE_SEED_LEAF in the environment wins.
 # To take a quad away from a serving replica, use --stop or a plain "docker stop" (or "docker rm -f"): docker records
 # the signal it was asked to send, so --recover sees the stop was made by hand, leaves the replica down and frees its
 # quad within a minute. Only a replica that went down by itself (card error, memory guard, killed for memory, docker
@@ -16,17 +21,19 @@
 # Deletes nothing: a stopped container of the same name and an old run folder are renamed with a time stamp.
 set -u
 KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROLE="${1:?usage: champion_boot.sh r0|r1 [--plan|--stop|--recover]}"
+ROLE="${1:?usage: champion_boot.sh r0|r1 [--plan|--stop|--recover|--pin-acc|--keep-seed]}"
 MODE="${2:-start}"
 case "$ROLE" in r0|r1) ;; *) echo "HALT champion_boot.sh: role $ROLE is not r0 or r1" >&2; exit 2 ;; esac
-case "$MODE" in start|--plan|--stop|--recover) ;;
-    *) echo "HALT champion_boot.sh: mode $MODE is not --plan, --stop or --recover" >&2; exit 2 ;; esac
+case "$MODE" in start|--plan|--stop|--recover|--pin-acc|--keep-seed) ;;
+    *) echo "HALT champion_boot.sh: mode $MODE is not --plan, --stop, --recover, --pin-acc or --keep-seed" >&2; exit 2 ;; esac
 Q="${QUEUE_DIR:-/mnt/data1/graded-out/queue}"
 STAGED="$KIT_DIR/champion.staged"
 CUT="$(sed -n 's/^CHAMPION_CUT=//p' "$STAGED" 2> /dev/null)"
 FINAL_ENV_FILE="$(sed -n 's/^CHAMPION_FINAL_ENV=//p' "$STAGED" 2> /dev/null)"
 [ -n "$CUT" ] && [ -n "$FINAL_ENV_FILE" ] || {
     echo "HALT champion_boot.sh: $STAGED names no CHAMPION_CUT or CHAMPION_FINAL_ENV; stage a champion with promote_r4h.sh stage --final-env" >&2; exit 2; }
+IMAGE_SHA="$(sed -n 's/^CHAMPION_IMAGE_SHA=//p' "$STAGED" 2> /dev/null)"
+RECIPE_ROOT="${RECIPE_ROOT:-/mnt/data1/recipe_cache}"   # where the launcher makes its leaves (lab_serve_seeded.py RECIPE_ROOT)
 NAME="claude-flash-launch-glm53flash-$ROLE-$CUT"
 RUN="$Q/serve-$CUT-$ROLE"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -46,6 +53,132 @@ say() { echo "$(TZ=America/New_York date '+%F %T %Z') [$ROLE] $*" | tee -a "$LOG
 is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2> /dev/null)" = true ]; }
 exists() { docker inspect "$NAME" > /dev/null 2>&1; }
 was_serving() { grep -q ' SERVING ' "$RUN/status" 2> /dev/null; }
+sha12() { local sha="${1#sha256:}"; echo "${sha:0:12}"; }
+seed_record() { echo "$Q/recipe-seed-$(sha12 "$1").leaf"; }   # $1 image id: the leaf its last serving boot used
+leaf_has_files() { [ -d "$1" ] && [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2> /dev/null)" ]; }
+
+# Seeded recipe cache (2026-11-22): an empty leaf recompiles every graph on all four cards at once, which stresses the host.
+container_leaf() {   # the host path of the recipe leaf the container uses (its PT_HPU_RECIPE_CACHE_CONFIG=/recipe_cache/<leaf>,...)
+    local config
+    config="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2> /dev/null | sed -n 's/^PT_HPU_RECIPE_CACHE_CONFIG=//p')"
+    config="${config%%,*}"
+    [ -n "$config" ] && echo "$RECIPE_ROOT/${config##*/}"
+}
+
+record_seed_leaf() {   # after SERVING: this boot's leaf seeds the next boot of the same image (temp file + mv)
+    local image leaf record
+    image="$(docker inspect -f '{{.Image}}' "$NAME" 2> /dev/null)"
+    leaf="$(container_leaf)"
+    if [ -z "$image" ] || ! leaf_has_files "$leaf"; then
+        say "SEED_RECORD_SKIPPED $NAME: image '$image' leaf '$leaf' (no image id, or no leaf with files); the earlier record stays"; return 0
+    fi
+    record="$(seed_record "$image")"
+    if ! { printf '%s\n' "$leaf" > "$record.tmp.$$" && mv -f "$record.tmp.$$" "$record"; }; then
+        rm -f "$record.tmp.$$"; say "SEED_RECORD_FAILED could not write $record; make $Q writable"; return 0
+    fi
+    say "SEED_RECORDED $leaf for image $(sha12 "$image") ($record)"
+}
+
+choose_seed() {   # before a boot: the caller's LAB_RECIPE_SEED_LEAF, else the recorded leaf, else the protected copy, else none
+    if [ -n "${LAB_RECIPE_SEED_LEAF:-}" ]; then say "SEED $LAB_RECIPE_SEED_LEAF (LAB_RECIPE_SEED_LEAF from the environment)"; return 0; fi
+    unset LAB_RECIPE_SEED_LEAF
+    if [ -z "$IMAGE_SHA" ]; then say "SEED none ($STAGED names no CHAMPION_IMAGE_SHA)"; return 0; fi
+    local record leaf="" seed
+    record="$(seed_record "$IMAGE_SHA")"
+    [ -f "$record" ] && leaf="$(head -n 1 "$record")"
+    if [ -n "$leaf" ] && leaf_has_files "$leaf"; then export LAB_RECIPE_SEED_LEAF="$leaf"; say "SEED $leaf"; return 0; fi
+    seed="$(seed_dir "$IMAGE_SHA")"
+    if is_kit_seed "$IMAGE_SHA" && leaf_has_files "$seed"; then
+        export LAB_RECIPE_SEED_LEAF="$seed"
+        say "SEED $seed (the protected copy; the recorded leaf '$leaf' is gone or empty)"; return 0
+    fi
+    if [ ! -f "$record" ]; then say "SEED none (no recorded leaf for image $(sha12 "$IMAGE_SHA"))"; return 0; fi
+    say "SEED none (the leaf $record names, '$leaf', is gone or empty, and no protected copy; the next boot that serves records a new one)"
+}
+
+# Durable seed (2026-11-22): lab.py down of the serving name removes its leaf (lab_serve_seeded.py remove_leaf), which leaves the
+# record above naming nothing. After a serving boot one copy per image is kept as recipe_cache/seed-<sha12>: never a claude-flash-*
+# leaf, so lab.py never removes it. A real copy (ext4 has no reflink; protected_hardlinks refuses links to the container's
+# root-owned recipes) at idle IO priority, swapped in whole (mv --exchange). Its mark in the queue (recipe-seed-<sha12>.copy:
+# line 1 the image id, line 2 the copy) proves the kit made it: only a marked copy is used, replaced or pruned.
+SEEDS_KEPT=2                                  # copies kept: the newest images' (the one just copied always stays)
+seed_dir() { echo "$RECIPE_ROOT/seed-$(sha12 "$1")"; }
+seed_mark() { echo "$Q/recipe-seed-$(sha12 "$1").copy"; }
+is_kit_seed() {   # $1 image id: seed-<sha12> is there and its mark names it
+    [ -d "$(seed_dir "$1")" ] && [ -f "$(seed_mark "$1")" ] && [ "$(sed -n 2p "$(seed_mark "$1")")" = "$(seed_dir "$1")" ]
+}
+
+write_mark() {   # $1 image id (temp file + mv)
+    local mark
+    mark="$(seed_mark "$1")"
+    printf '%s\n%s\n' "$1" "$(seed_dir "$1")" > "$mark.tmp.$$" && mv -f "$mark.tmp.$$" "$mark" || { rm -f "$mark.tmp.$$"; return 1; }
+}
+
+IDLE=(ionice -c3 nice -n19)                   # the copy and its clean-up yield to every other disk and cpu user
+remove_dead_temp_copies() {   # $1 seed folder: <seed>.new-<pid> copies whose champion_boot.sh is gone (killed mid-copy)
+    local temp pid
+    for temp in "$1".new-*; do
+        pid="${temp##*.new-}"
+        if [ -d "$temp" ] && [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2> /dev/null; then "${IDLE[@]}" rm -rf -- "$temp"; fi
+    done
+}
+
+copy_seed() {   # $1 image id, $2 leaf: a fresh full copy beside the old one, then one rename swaps it in
+    local seed new
+    seed="$(seed_dir "$1")"; new="$seed.new-$$"
+    if [ -e "$seed" ] && ! is_kit_seed "$1"; then say "SEED_COPY_SKIPPED $seed has no mark $(seed_mark "$1"): not a copy this kit made; left alone"; return 1; fi
+    remove_dead_temp_copies "$seed"
+    if ! { mkdir -- "$new" && "${IDLE[@]}" cp -a -- "$2/." "$new/"; }; then
+        "${IDLE[@]}" rm -rf -- "$new"; say "SEED_COPY_FAILED could not copy $2 to $new; the earlier copy (if any) stays"; return 1
+    fi
+    if [ -e "$seed" ]; then   # the old copy comes out under the temp name, so a reader never finds seed-<sha12> missing
+        mv --exchange -T -- "$new" "$seed" || { "${IDLE[@]}" rm -rf -- "$new"; say "SEED_COPY_FAILED could not swap $new with $seed; the earlier copy stays"; return 1; }
+        "${IDLE[@]}" rm -rf -- "$new"; touch -- "$(seed_mark "$1")"; return 0
+    fi
+    write_mark "$1" && mv -T -- "$new" "$seed" && return 0
+    "${IDLE[@]}" rm -rf -- "$new"; say "SEED_COPY_FAILED could not move $new to $seed"; return 1
+}
+
+prune_seeds() {   # $1 the image just copied: marked copies of other images beyond the SEEDS_KEPT newest marks go
+    local mark image kept=0
+    while IFS= read -r mark; do
+        image="$(sed -n 1p "$mark")"
+        if [ "$mark" != "$(seed_mark "$image")" ] || [ "$(sed -n 2p "$mark")" != "$(seed_dir "$image")" ] || ! [[ "$(sha12 "$image")" =~ ^[0-9a-f]{12}$ ]]; then
+            say "SEED_PRUNE_SKIPPED $mark does not name its own seed-<sha12> copy; left alone"; continue
+        fi
+        kept=$((kept + 1))
+        if [ "$(sha12 "$image")" = "$(sha12 "$1")" ] || [ "$kept" -le "$SEEDS_KEPT" ]; then continue; fi
+        "${IDLE[@]}" rm -rf -- "$(seed_dir "$image")" && rm -f -- "$mark" && say "SEED_PRUNED $(seed_dir "$image") (image $(sha12 "$image"); the $SEEDS_KEPT newest copies stay)"
+    done < <(ls -1t -- "$Q"/recipe-seed-*.copy 2> /dev/null)
+}
+
+keep_seed_copy() {   # after SERVING and the pins (or --keep-seed): the protected copy of the replica's leaf, then the prune
+    local image leaf
+    image="$(docker inspect -f '{{.Image}}' "$NAME" 2> /dev/null)"
+    leaf="$(container_leaf)"
+    if [ -z "$image" ] || ! leaf_has_files "$leaf"; then say "SEED_COPY_SKIPPED $NAME: image '$image' leaf '$leaf' (no image id, or no leaf with files)"; return 1; fi
+    copy_seed "$image" "$leaf" || return 1
+    say "SEED_COPIED $leaf -> $(seed_dir "$image") (protected from lab.py down; mark $(seed_mark "$image"))"
+    prune_seeds "$image"
+}
+
+keep_seed_running() {   # --keep-seed: a replica adopted without a boot by this kit gets its protected copy now
+    is_running || { say "HALT $NAME is not running; no leaf to keep (a boot that serves keeps one: champion_boot.sh $ROLE)"; return 1; }
+    keep_seed_copy
+}
+
+# common.sh runs in a clean shell: its test-hook names (STAGED, ...) are plain variables here.
+pin_acc() {
+    local line
+    KIT_DIR="$KIT_DIR" bash -c 'source "$KIT_DIR/common.sh" && pin_acc_threads "$1"' pin-acc "$ROLE" 2>&1 \
+        | while IFS= read -r line; do say "$line"; done
+    return "${PIPESTATUS[0]}"
+}
+
+pin_running() {   # --pin-acc
+    is_running || { say "HALT $NAME is not running; nothing to pin (start it: champion_boot.sh $ROLE)"; return 1; }
+    pin_acc
+}
 
 # The stop keeps its own record, written before docker is asked: the container can take a minute to end, the timer runs
 # meanwhile, and docker's event history (256 events, about 100 s on this host) may no longer hold the "kill" afterwards.
@@ -74,6 +207,7 @@ plan() {
     [ -d "$RUN" ] && say "PLAN touch $RELEASE (frees the stopped replica's quad holder), wait up to ${HOLDER_WAIT_S}s"
     [ -e "$RUN" ] && say "PLAN mv $RUN $RUN.run-$STAMP"
     say "PLAN serve_champion.sh $ROLE --check, then serve_champion.sh $ROLE (cut $CUT, final env $FINAL_ENV_FILE)"
+    choose_seed
 }
 
 start_replica() {
@@ -85,11 +219,16 @@ start_replica() {
     local check
     check="$(env -u LAB_MAX_MODEL_LEN FINAL_ENV="$FINAL_ENV_FILE" bash serve_champion.sh "$ROLE" --check 2>&1 | tail -n 1)"
     case "$check" in CHAMPION_CHECK_OK*) say "$check" ;; *) say "HALT pre-boot check refused: $check (fix champion.staged or its files, then rerun)"; return 1 ;; esac
+    choose_seed
     say "BOOT $NAME (about 15 min)"
     env -u LAB_MAX_MODEL_LEN FINAL_ENV="$FINAL_ENV_FILE" bash serve_champion.sh "$ROLE" < /dev/null > "$Q/champion-boot-$ROLE.console" 2>&1
     if was_serving && is_running; then
         date > "$WANTED"
-        say "SERVING $(grep ' BOOTED ' "$RUN/status" | tail -n 1 | cut -c25-120)"; return 0
+        say "SERVING $(grep ' BOOTED ' "$RUN/status" | tail -n 1 | cut -c25-120)"
+        record_seed_leaf
+        pin_acc || say "ACC_PIN_INCOMPLETE $NAME serves with its AccThreadPool threads unpinned; once fixed: champion_boot.sh $ROLE --pin-acc"
+        keep_seed_copy
+        return 0
     fi
     say "HALT $NAME did not come up: $(tail -n 2 "$RUN/status" 2> /dev/null | tr '\n' ' ' | cut -c1-400) (console: $Q/champion-boot-$ROLE.console)"
     return 1
@@ -213,6 +352,8 @@ run_locked() {
 case "$MODE" in
     --plan) plan ;;
     --stop) stop_replica ;;
+    --pin-acc) pin_running; exit $? ;;
+    --keep-seed) keep_seed_running; exit $? ;;
     start|--recover)
         if [ -z "${CHAMPION_BOOT_LOCKED:-}" ]; then
             run_locked; status=$?

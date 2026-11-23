@@ -324,6 +324,96 @@ class Promote(Kit):
         self.assertFalse([call for call in calls if call.startswith(("docker stop", "serve"))])
 
 
+KIT_KV_BLOCKS = "30880"   # serve_champion.sh's C1D_KV_BLOCKS: what a restart by the recover timer would boot
+
+
+class Adopt(Kit):
+    """adopt_check.sh: the replicas already serving are the staged champion (image, levers, KV blocks, /health); read-only."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        (self.state / "final.env").write_text("BASE=1\n")
+        run, _ = self.run_kit("promote_r4h.sh", "stage", "--image", CHAMPION_TAG, "--image-sha", CHAMPION,
+                              "--levers", str(self.state / "levers.env"), "--gates", str(self.state / "gates.env"),
+                              "--final-env", str(self.state / "final.env"))
+        self.assertEqual(run.returncode, 0, run.stdout)
+        for role in ("r0", "r1"):
+            self.container(f"claude-flash-launch-glm53flash-{role}-r4f", R4F, "false")
+            self.serving(role)
+
+    def serving(self, role: str, image: str = CHAMPION, kv_blocks: str = KIT_KV_BLOCKS) -> str:
+        name = f"claude-flash-launch-glm53flash-{role}-{CUT}"
+        self.container(name, image, "true")
+        shutil.copy(self.state / "levers.env", self.state / f"env-{name}")
+        (self.state / f"args-{name}").write_text(f"--port {18274 if role == 'r0' else 18275} --num-gpu-blocks-override {kv_blocks}")
+        return name
+
+    def changes(self, calls: list[str]) -> list[str]:
+        return [call for call in calls if call.startswith(("docker stop", "docker rename", "docker run", "docker create", "serve",
+                                                          "systemctl stop", "systemctl start"))]
+
+    def test_both_replicas_serving_the_staged_champion_adopt_without_any_change(self) -> None:
+        run, calls = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertIn(f"ADOPT_ROLE_OK r0 claude-flash-launch-glm53flash-r0-{CUT}", run.stdout)
+        self.assertIn(f"ADOPT_OK cut={CUT}", run.stdout)
+        self.assertEqual(self.changes(calls), [])
+        self.assertEqual(len([call for call in calls if call.startswith("curl") and "/health" in call]), 2)
+
+    def test_a_replica_on_another_image_refuses_naming_it(self) -> None:
+        self.serving("r1", image="sha256:" + "d" * 64)
+        run, calls = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("ADOPT_FAIL r1: claude-flash-launch-glm53flash-r1-r4h5 runs dddddddddddd, not the staged cccccccccccc", run.stdout)
+        self.assertIn("ADOPT_REFUSED", run.stdout)
+        self.assertEqual(self.changes(calls), [])
+
+    def test_a_lever_not_live_refuses_naming_the_key(self) -> None:
+        name = self.serving("r0")
+        (self.state / f"env-{name}").write_text("HPU_GLM53_CAPTURE_EXECUTE_KEYS=128:1024,128:8192\n")
+        run, _ = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn(f"VALUE-DRIFT {name} HPU_GLM53_ATTN_PIN intended=0 live=<unset>", run.stdout)
+
+    def test_kv_blocks_other_than_the_kits_refuse(self) -> None:
+        self.serving("r0", kv_blocks="33280")
+        run, _ = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn(f"serves 33280 KV blocks; a restart from this kit boots {KIT_KV_BLOCKS}", run.stdout)
+
+    def test_a_replica_that_is_not_running_refuses(self) -> None:
+        self.container(f"claude-flash-launch-glm53flash-r1-{CUT}", CHAMPION, "false")
+        run, calls = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 1, run.stdout)
+        self.assertIn("ADOPT_FAIL r1: claude-flash-launch-glm53flash-r1-r4h5 is not running", run.stdout)
+        self.assertEqual(self.changes(calls), [])
+
+    def test_a_moved_final_env_refuses_before_any_replica_is_read(self) -> None:
+        (self.state / "final.env").write_text("BASE=2\n")
+        run, _ = self.run_kit("adopt_check.sh")
+        self.assertEqual(run.returncode, 2, run.stdout)
+        self.assertIn("final.env is not the staged", run.stdout)
+
+    def test_launcher_check_runs_the_pre_boot_check_for_both_roles_only_when_asked(self) -> None:
+        _, calls = self.run_kit("adopt_check.sh")
+        self.assertEqual([call for call in calls if call.startswith("check")], [])
+        run, calls = self.run_kit("adopt_check.sh", "--launcher-check")
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertEqual([call for call in calls if call.startswith("check")], [f"check {CUT} r0", f"check {CUT} r1"])
+
+    def test_an_unknown_option_refuses(self) -> None:
+        run, _ = self.run_kit("adopt_check.sh", "--restart")
+        self.assertEqual(run.returncode, 2, run.stdout)
+        self.assertIn("usage: adopt_check.sh", run.stdout)
+
+    def test_promote_refuses_while_the_champion_already_holds_the_ports(self) -> None:
+        """Why adoption exists: promote_r4h.sh accepts only r4f on :18274/:18275, so it stops nothing and refuses."""
+        run, calls = self.run_kit("promote_r4h.sh", "--dry-run")
+        self.assertEqual(run.returncode, 2, run.stdout)
+        self.assertIn(f"is held by claude-flash-launch-glm53flash-r0-{CUT}, not claude-flash-launch-glm53flash-r0-r4f", run.stdout)
+        self.assertEqual(self.changes(calls), [])
+
+
 # docker for champion_check.sh: create/cp/rm against $STATE/img (the image's files); run is logged and refused (it would start one).
 FAKE_IMAGE_DOCKER = r'''#!/bin/bash
 echo "docker $*" >> "$STATE/calls"
@@ -375,6 +465,54 @@ class ChampionCheck(unittest.TestCase):
         launcher, helper = text.find('source "$L/diag-r4e/r4e_run.sh"'), text.find('source "$KIT_DIR/champion_check.sh"')
         self.assertGreater(launcher, 0)
         self.assertGreater(helper, launcher)   # sourced after r4e_run.sh, so its baked_sha replaces the docker-run one
+
+
+class AccThreadPins(unittest.TestCase):
+    """common.sh pin_acc_threads ROLE: the container's own AccThreadPool threads, one cpu each in ascending tid order."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.proc = self.root / "proc"
+        (self.root / "champion.staged").write_text(f"CHAMPION_CUT={CUT}\n")
+        for name, text in (("docker", '#!/bin/bash\n[ "$1 $2" = "top $ROOT_NAME" ] && { echo PID; cat "$STATE/pids"; }\nexit 0\n'),
+                           ("taskset", '#!/bin/bash\necho "taskset $*" >> "$STATE/calls"\n')):
+            (self.root / name).write_text(text)
+            (self.root / name).chmod(0o755)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def threads(self, role: str, tids_by_pid: dict[int, int]) -> str:
+        (self.root / "pids").write_text("".join(f"{pid}\n" for pid in sorted(tids_by_pid)))
+        for pid, tid in tids_by_pid.items():
+            for thread, comm in ((tid, "AccThreadPool"), (pid, "python3")):
+                (self.proc / str(pid) / "task" / str(thread)).mkdir(parents=True)
+                (self.proc / str(pid) / "task" / str(thread) / "comm").write_text(comm + "\n")
+        return f"claude-flash-launch-glm53flash-{role}-{CUT}"
+
+    def pin(self, role: str, name: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+        env = dict(os.environ, GLM53_PROMOTE_TEST="1", KIT_DIR=str(HERE), STAGED=str(self.root / "champion.staged"), SUDO="",
+                   DOCKER=str(self.root / "docker"), TASKSET=str(self.root / "taskset"), PROC_ROOT=str(self.proc),
+                   STATE=str(self.root), ROOT_NAME=name)
+        run = subprocess.run(["bash", "-c", 'source "$KIT_DIR/common.sh" && pin_acc_threads "$1"', "pin", role],
+                             env=env, capture_output=True, text=True, timeout=60)
+        calls = (self.root / "calls").read_text().splitlines() if (self.root / "calls").exists() else []
+        return run, calls
+
+    def test_four_r1_threads_get_cpus_14_to_17_in_tid_order(self) -> None:
+        name = self.threads("r1", {10: 704, 20: 702, 30: 1000, 40: 703})
+        run, calls = self.pin("r1", name)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(calls, ["taskset -pc 14 702", "taskset -pc 15 703", "taskset -pc 16 704", "taskset -pc 17 1000"])
+        self.assertIn(f"ACC_PIN_DONE role=r1 container={name} pinned=4/4 cpus=14-17", run.stdout)
+
+    def test_three_threads_pin_nothing_and_warn(self) -> None:
+        name = self.threads("r0", {10: 11, 20: 21, 30: 31})
+        run, calls = self.pin("r0", name)
+        self.assertEqual(run.returncode, 1)
+        self.assertEqual(calls, [])
+        self.assertIn("ACC_PIN_WARN role=r0 found 3 AccThreadPool threads", run.stdout)
 
 
 class Rollback(Kit):

@@ -23,6 +23,8 @@ CUT = "tcut"
 ROLE = "r0"
 RUN_FOLDER = f"serve-{CUT}-{ROLE}"
 HOLDER_START_TIMEOUT_S = 5.0
+IMAGE = "sha256:" + "ab12" * 16           # the staged image
+OTHER_IMAGE = "sha256:" + "cd34" * 16     # another image's record must never seed this one
 
 FAKE_DOCKER = """#!/bin/bash
 # docker stand-in. $FAKE_STATE/docker-state holds "absent", "stopped" or "running"; docker-events holds the actions
@@ -37,7 +39,10 @@ case "$1" in
             *State.OOMKilled*) if [ -e "$FAKE_STATE/oom-killed" ]; then echo true; else echo false; fi ;;
             *State.FinishedAt*) date -u +%FT%T.000000000Z ;;
             *.Id*) echo stand-in-container-id ;;
+            *Config.Env*) cat "$FAKE_STATE/container-env" 2> /dev/null ;;
+            *'{{.Image}}'*) cat "$FAKE_STATE/container-image" 2> /dev/null ;;
         esac ;;
+    top) echo PID; cat "$FAKE_STATE/container-pids" 2> /dev/null ;;
     events) cat "$FAKE_STATE/docker-events" 2> /dev/null ;;
     rename) echo absent > "$FAKE_STATE/docker-state" ;;
     cp) mkdir -p "$3" && echo "synapse log" > "$3/dfa_log.txt" ;;
@@ -61,6 +66,7 @@ FAKE_SERVE = f"""#!/bin/bash
 if [ "${{2:-}}" = --check ]; then echo "CHAMPION_CHECK_OK role=$1"; exit 0; fi
 run="$QUEUE_DIR/serve-{CUT}-$1"
 if [ -e "$FAKE_STATE/holder-alive" ]; then echo holder=alive; else echo holder=gone; fi >> "$FAKE_STATE/serve-saw"
+echo "${{LAB_RECIPE_SEED_LEAF:-none}}" >> "$FAKE_STATE/serve-seed"
 mkdir -p "$run"
 if [ -e "$FAKE_STATE/serve-fails" ]; then echo "2026-01-01 00:00:00 EST BOOT_FAILED stand-in" >> "$run/status"; exit 1; fi
 echo "2026-01-01 00:00:00 EST BOOTED serve role=$1 up rc=0 boot_s=1 running=true" >> "$run/status"
@@ -74,6 +80,12 @@ FAKE_JOURNALCTL = """#!/bin/bash
 # journalctl stand-in: two kernel lines, one of them from the card driver.
 echo "Jan 01 00:00:00 host kernel: habanalabs 0000:cd:00.0: Going to reset device"
 echo "Jan 01 00:00:00 host kernel: unrelated line"
+"""
+
+FAKE_TASKSET = """#!/bin/bash
+# taskset stand-in: records each pin; the file taskset-fails makes every pin fail.
+echo "taskset $*" >> "$FAKE_STATE/calls"
+[ ! -e "$FAKE_STATE/taskset-fails" ]
 """
 
 FAKE_HOLDER = """#!/bin/bash
@@ -102,9 +114,14 @@ class ChampionBoot(unittest.TestCase):
         for folder in (self.kit, self.queue, self.state, self.bin):
             folder.mkdir()
         shutil.copy(SCRIPT_UNDER_TEST, self.kit / "champion_boot.sh")
+        shutil.copy(SCRIPT_UNDER_TEST.parent / "common.sh", self.kit / "common.sh")
         write_script(self.kit / "serve_champion.sh", FAKE_SERVE)
-        (self.kit / "champion.staged").write_text(f"CHAMPION_CUT={CUT}\nCHAMPION_FINAL_ENV={self.root}/final.env\n")
+        (self.kit / "champion.staged").write_text(f"CHAMPION_CUT={CUT}\nCHAMPION_FINAL_ENV={self.root}/final.env\n"
+                                                  f"CHAMPION_IMAGE_SHA={IMAGE}\n")
+        self.recipes = self.root / "recipe_cache"
+        self.proc = self.root / "proc"
         write_script(self.bin / "docker", FAKE_DOCKER)
+        write_script(self.bin / "taskset", FAKE_TASKSET)
         write_script(self.bin / "journalctl", FAKE_JOURNALCTL)
         write_script(self.bin / "systemctl", FAKE_SYSTEMCTL)
         self.wanted = self.queue / f"champion-{ROLE}.wanted"
@@ -132,11 +149,15 @@ class ChampionBoot(unittest.TestCase):
         return holder
 
     def boot_env(self, holder_wait_s: int = 10, max_tries: int = 3) -> dict[str, str]:
-        return dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}", QUEUE_DIR=str(self.queue),
-                    FAKE_STATE=str(self.state), HOLDER_WAIT_S=str(holder_wait_s), RECOVER_MAX_TRIES=str(max_tries))
+        base = {key: value for key, value in os.environ.items() if key != "LAB_RECIPE_SEED_LEAF"}
+        return dict(base, PATH=f"{self.bin}:{os.environ['PATH']}", QUEUE_DIR=str(self.queue),
+                    FAKE_STATE=str(self.state), HOLDER_WAIT_S=str(holder_wait_s), RECOVER_MAX_TRIES=str(max_tries),
+                    RECIPE_ROOT=str(self.recipes), GLM53_PROMOTE_TEST="1", PROC_ROOT=str(self.proc), SUDO="")
 
-    def boot(self, *args: str, holder_wait_s: int = 10, max_tries: int = 3) -> subprocess.CompletedProcess:
-        return subprocess.run(["bash", str(self.kit / "champion_boot.sh"), ROLE, *args], env=self.boot_env(holder_wait_s, max_tries),
+    def boot(self, *args: str, holder_wait_s: int = 10, max_tries: int = 3,
+             extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        env = dict(self.boot_env(holder_wait_s, max_tries), **(extra_env or {}))
+        return subprocess.run(["bash", str(self.kit / "champion_boot.sh"), ROLE, *args], env=env,
                               capture_output=True, text=True, timeout=60)
 
     def boot_in_background(self, *args: str) -> subprocess.Popen:
@@ -498,6 +519,397 @@ class Recover(ChampionBoot):
         self.assertIn("BOOT_IN_PROGRESS", by_hand.stdout)
         self.assertEqual(by_timer.stdout, "")
         self.assertEqual(self.serve_starts(), 0)
+
+
+class SeededCache(ChampionBoot):
+    """The recipe leaf a serving boot used seeds the next boot of the same image (recipe-seed-<sha12>.leaf in the queue)."""
+
+    def leaf(self, name: str, files: int = 1) -> Path:
+        leaf = self.recipes / name
+        leaf.mkdir(parents=True)
+        for index in range(files):
+            (leaf / f"graph{index}.recipe").write_text("recipe\n")
+        return leaf
+
+    def record(self, image: str, leaf: Path) -> Path:
+        record = self.queue / f"recipe-seed-{image.removeprefix('sha256:')[:12]}.leaf"
+        record.write_text(f"{leaf}\n")
+        return record
+
+    def booted_container_uses(self, leaf_name: str, image: str = IMAGE) -> None:
+        """What docker inspect shows for the container the stand-in serve started."""
+        (self.state / "container-env").write_text(f"PATH=/usr/bin\nPT_HPU_RECIPE_CACHE_CONFIG=/recipe_cache/{leaf_name},false,8192\n")
+        (self.state / "container-image").write_text(image + "\n")
+
+    def seed_seen(self) -> str:
+        return (self.state / "serve-seed").read_text().strip()
+
+    def test_recorded_leaf_of_the_staged_image_seeds_the_boot(self) -> None:
+        self.docker_state("absent")
+        leaf = self.leaf("earlier-r1-leaf")
+        self.record(IMAGE, leaf)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.seed_seen(), str(leaf))
+        self.assertIn(f"SEED {leaf}", run.stdout)
+
+    def test_recorded_leaf_that_is_gone_boots_unseeded(self) -> None:
+        self.docker_state("absent")
+        self.record(IMAGE, self.recipes / "removed-leaf")
+
+        run = self.boot()
+
+        self.assertEqual(self.seed_seen(), "none")
+        self.assertIn("SEED none (the leaf", run.stdout)
+
+    def test_recorded_leaf_that_is_empty_boots_unseeded(self) -> None:
+        self.docker_state("absent")
+        self.record(IMAGE, self.leaf("empty-leaf", files=0))
+
+        run = self.boot()
+
+        self.assertEqual(self.seed_seen(), "none")
+        self.assertIn("is gone or empty", run.stdout)
+
+    def test_leaf_recorded_for_another_image_never_seeds(self) -> None:
+        self.docker_state("absent")
+        self.record(OTHER_IMAGE, self.leaf("other-image-leaf"))
+
+        run = self.boot()
+
+        self.assertEqual(self.seed_seen(), "none")
+        self.assertIn(f"SEED none (no recorded leaf for image {IMAGE.removeprefix('sha256:')[:12]})", run.stdout)
+
+    def test_seed_leaf_from_the_environment_wins_over_the_record(self) -> None:
+        self.docker_state("absent")
+        self.record(IMAGE, self.leaf("recorded-leaf"))
+        chosen = str(self.recipes / "chosen-by-hand")
+
+        run = self.boot(extra_env={"LAB_RECIPE_SEED_LEAF": chosen})
+
+        self.assertEqual(self.seed_seen(), chosen)
+        self.assertIn(f"SEED {chosen} (LAB_RECIPE_SEED_LEAF from the environment)", run.stdout)
+
+    def test_boot_that_serves_records_its_leaf_for_its_image(self) -> None:
+        self.docker_state("absent")
+        self.record(IMAGE, self.leaf("older-leaf"))
+        new_leaf = self.leaf("claude-flash-launch-glm53flash-r0-tcut-20261122T200000Z")
+        self.booted_container_uses(new_leaf.name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        record = self.queue / f"recipe-seed-{IMAGE.removeprefix('sha256:')[:12]}.leaf"
+        self.assertEqual(record.read_text(), f"{new_leaf}\n")
+        self.assertEqual(sorted(path.name for path in self.queue.glob("recipe-seed-*.leaf*")), [record.name], "a temp file was left")
+        self.assertIn(f"SEED_RECORDED {new_leaf}", run.stdout)
+
+    def test_boot_that_fails_records_nothing(self) -> None:
+        self.docker_state("absent")
+        self.booted_container_uses(self.leaf("failed-boot-leaf").name)
+        (self.state / "serve-fails").touch()
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(list(self.queue.glob("recipe-seed-*")), [])
+        self.assertNotIn("SEED_RECORDED", run.stdout)
+
+    def test_boot_whose_leaf_is_empty_keeps_the_earlier_record(self) -> None:
+        self.docker_state("absent")
+        older = self.leaf("older-leaf")
+        record = self.record(IMAGE, older)
+        self.booted_container_uses(self.leaf("empty-new-leaf", files=0).name)
+
+        run = self.boot()
+
+        self.assertEqual(record.read_text(), f"{older}\n")
+        self.assertIn("SEED_RECORD_SKIPPED", run.stdout)
+
+    def test_plan_names_the_seed_and_records_nothing(self) -> None:
+        self.docker_state("absent")
+        leaf = self.leaf("recorded-leaf")
+        self.record(IMAGE, leaf)
+
+        run = self.boot("--plan")
+
+        self.assertIn(f"SEED {leaf}", run.stdout)
+        self.assertEqual(self.serve_saw(), "never started")
+
+    # Durable seed: a serving boot keeps one protected copy of its leaf per image (recipe_cache/seed-<sha12>, marked in the
+    # queue by recipe-seed-<sha12>.copy). lab.py down of the serving name removes the leaf; the copy still seeds the next boot.
+
+    @staticmethod
+    def sha12(image: str) -> str:
+        return image.removeprefix("sha256:")[:12]
+
+    def seed_dir(self, image: str = IMAGE) -> Path:
+        return self.recipes / f"seed-{self.sha12(image)}"
+
+    def mark(self, image: str = IMAGE) -> Path:
+        return self.queue / f"recipe-seed-{self.sha12(image)}.copy"
+
+    def our_seed(self, image: str, files: dict[str, str], age_s: int = 0) -> Path:
+        """A copy this kit made earlier: the seed folder and its mark (line 1 the image, line 2 the folder)."""
+        seed = self.seed_dir(image)
+        seed.mkdir(parents=True)
+        for name, text in files.items():
+            (seed / name).write_text(text)
+        self.mark(image).write_text(f"{image}\n{seed}\n")
+        stamp = time.time() - age_s
+        os.utime(self.mark(image), (stamp, stamp))
+        return seed
+
+    def leftovers(self) -> list[str]:
+        return sorted(path.name for path in self.recipes.glob("seed-*.*"))
+
+    def test_boot_that_serves_keeps_a_protected_copy_of_its_leaf(self) -> None:
+        self.docker_state("absent")
+        leaf = self.leaf("claude-flash-launch-glm53flash-r0-tcut-20261122T210000Z", files=3)
+        self.booted_container_uses(leaf.name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        seed = self.seed_dir()
+        self.assertEqual(sorted(path.name for path in seed.iterdir()), sorted(path.name for path in leaf.iterdir()))
+        self.assertEqual(self.mark().read_text(), f"{IMAGE}\n{seed}\n")
+        self.assertEqual(self.leftovers(), [], "a temp copy was left")
+        self.assertIn(f"SEED_COPIED {leaf} -> {seed}", run.stdout)
+
+    def test_the_protected_copy_seeds_the_boot_once_lab_down_removed_the_recorded_leaf(self) -> None:
+        self.docker_state("absent")
+        self.record(IMAGE, self.recipes / "claude-flash-launch-glm53flash-r0-tcut-removed-by-lab-down")
+        seed = self.our_seed(IMAGE, {"graph0.recipe": "recipe\n"})
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.seed_seen(), str(seed))
+        self.assertIn(f"SEED {seed} (the protected copy", run.stdout)
+
+    def test_the_recorded_leaf_still_wins_over_the_copy_while_it_exists(self) -> None:
+        self.docker_state("absent")
+        leaf = self.leaf("live-leaf")
+        self.record(IMAGE, leaf)
+        self.our_seed(IMAGE, {"graph0.recipe": "recipe\n"})
+
+        self.boot()
+
+        self.assertEqual(self.seed_seen(), str(leaf))
+
+    def test_a_copy_for_another_image_never_seeds(self) -> None:
+        self.docker_state("absent")
+        self.our_seed(OTHER_IMAGE, {"graph0.recipe": "recipe\n"})
+
+        run = self.boot()
+
+        self.assertEqual(self.seed_seen(), "none")
+        self.assertIn("SEED none (no recorded leaf", run.stdout)
+
+    def test_an_unmarked_seed_folder_is_never_used_replaced_or_pruned(self) -> None:
+        self.docker_state("absent")
+        foreign = self.seed_dir()
+        foreign.mkdir(parents=True)
+        (foreign / "foreign.recipe").write_text("not ours\n")
+        self.booted_container_uses(self.leaf("new-leaf").name)
+
+        run = self.boot()
+
+        self.assertEqual(self.seed_seen(), "none")
+        self.assertEqual([path.name for path in foreign.iterdir()], ["foreign.recipe"])
+        self.assertFalse(self.mark().exists())
+        self.assertIn("SEED_COPY_SKIPPED", run.stdout)
+
+    def test_a_refresh_swaps_the_whole_copy_and_leaves_no_temp_folder(self) -> None:
+        self.docker_state("absent")
+        seed = self.our_seed(IMAGE, {"stale.recipe": "old\n"}, age_s=3600)
+        self.booted_container_uses(self.leaf("new-leaf", files=2).name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(sorted(path.name for path in seed.iterdir()), ["graph0.recipe", "graph1.recipe"])
+        self.assertEqual(self.leftovers(), [])
+        self.assertGreater(self.mark().stat().st_mtime, time.time() - 600, "the mark was not refreshed")
+
+    def test_only_the_two_newest_copies_stay_and_nothing_unmarked_is_touched(self) -> None:
+        self.docker_state("absent")
+        images = ["sha256:" + digit * 64 for digit in "123"]
+        for age, image in zip((300, 200, 100), images):
+            self.our_seed(image, {"graph0.recipe": "recipe\n"}, age_s=age)
+        unmarked = self.recipes / f"seed-{'4' * 12}"
+        unmarked.mkdir()
+        self.booted_container_uses(self.leaf("claude-flash-launch-glm53flash-r0-tcut-20261122T220000Z").name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        kept = sorted(path.name for path in self.recipes.glob("seed-*"))
+        self.assertEqual(kept, sorted([self.seed_dir().name, self.seed_dir(images[2]).name, unmarked.name]))
+        self.assertEqual(sorted(path.name for path in self.queue.glob("recipe-seed-*.copy")),
+                         sorted([self.mark().name, self.mark(images[2]).name]))
+        self.assertTrue((self.recipes / "claude-flash-launch-glm53flash-r0-tcut-20261122T220000Z").is_dir())
+        self.assertIn(f"SEED_PRUNED {self.seed_dir(images[0])}", run.stdout)
+
+    def test_a_mark_that_names_another_folder_is_left_alone(self) -> None:
+        self.docker_state("absent")
+        elsewhere = self.recipes / "claude-flash-launch-glm53flash-r1-tcut-20261101T000000Z"
+        elsewhere.mkdir(parents=True)
+        for age, digit in ((300, "1"), (200, "2")):
+            self.our_seed("sha256:" + digit * 64, {"graph0.recipe": "recipe\n"}, age_s=age)
+        self.mark("sha256:" + "1" * 64).write_text(f"sha256:{'1' * 64}\n{elsewhere}\n")
+        self.booted_container_uses(self.leaf("new-leaf").name)
+
+        run = self.boot()
+
+        self.assertTrue(elsewhere.is_dir())
+        self.assertIn("SEED_PRUNE_SKIPPED", run.stdout)
+
+    def test_a_copy_that_fails_leaves_no_partial_copy_and_the_boot_still_serves(self) -> None:
+        self.docker_state("absent")
+        leaf = self.leaf("new-leaf", files=2)
+        (leaf / "graph1.recipe").chmod(0)
+        self.booted_container_uses(leaf.name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(self.seed_dir().exists())
+        self.assertFalse(self.mark().exists())
+        self.assertEqual(self.leftovers(), [])
+        self.assertIn("SEED_COPY_FAILED", run.stdout)
+        self.assertTrue(self.wanted.exists())
+
+    def test_a_temp_copy_left_by_a_killed_boot_is_removed_and_a_live_ones_kept(self) -> None:
+        self.docker_state("absent")
+        dead = self.recipes / f"seed-{self.sha12(IMAGE)}.new-999999999"   # above pid_max: no such process
+        live = self.recipes / f"seed-{self.sha12(IMAGE)}.new-{os.getpid()}"
+        for temp in (dead, live):
+            temp.mkdir(parents=True)
+            (temp / "graph0.recipe").write_text("half a copy\n")
+        self.booted_container_uses(self.leaf("new-leaf").name)
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertFalse(dead.exists())
+        self.assertTrue(live.is_dir())
+        self.assertTrue(self.seed_dir().is_dir())
+
+    def test_keep_seed_mode_copies_a_running_replicas_leaf_without_starting_anything(self) -> None:
+        self.docker_state("running")
+        leaf = self.leaf("adopted-leaf", files=2)
+        self.booted_container_uses(leaf.name)
+
+        run = self.boot("--keep-seed")
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(sorted(path.name for path in self.seed_dir().iterdir()), ["graph0.recipe", "graph1.recipe"])
+        self.assertIn(f"SEED_COPIED {leaf}", run.stdout)
+        self.assertEqual(self.serve_saw(), "never started")
+
+    def test_keep_seed_mode_on_a_stopped_replica_says_so_and_fails(self) -> None:
+        self.docker_state("stopped")
+        self.booted_container_uses(self.leaf("old-leaf").name)
+
+        run = self.boot("--keep-seed")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("is not running; no leaf to keep", run.stdout)
+        self.assertFalse(self.seed_dir().exists())
+
+    def test_boot_that_fails_copies_nothing(self) -> None:
+        self.docker_state("absent")
+        self.booted_container_uses(self.leaf("failed-boot-leaf").name)
+        (self.state / "serve-fails").touch()
+
+        self.boot()
+
+        self.assertFalse(self.seed_dir().exists())
+
+
+class AccThreadPins(ChampionBoot):
+    """After a boot that serves, the 4 AccThreadPool threads get one cpu each (r0: 50-53, ascending tid)."""
+
+    def threads(self, accs: dict[int, list[int]], others: dict[int, list[int]] | None = None) -> None:
+        """The container's processes (docker top) and their threads: accs are AccThreadPool, others are not."""
+        pids = sorted(set(accs) | set(others or {}))
+        (self.state / "container-pids").write_text("".join(f"{pid}\n" for pid in pids))
+        for kind, table in (("AccThreadPool", accs), ("python3", others or {})):
+            for pid, tids in table.items():
+                for tid in tids:
+                    task = self.proc / str(pid) / "task" / str(tid)
+                    task.mkdir(parents=True)
+                    (task / "comm").write_text(kind + "\n")
+
+    def taskset_calls(self) -> list[str]:
+        calls = self.state / "calls"
+        return [line for line in calls.read_text().splitlines() if line.startswith("taskset")] if calls.exists() else []
+
+    def test_boot_that_serves_pins_the_four_threads_in_tid_order(self) -> None:
+        self.docker_state("absent")
+        self.threads({300: [3005], 100: [1009], 200: [2001], 400: [900]}, others={100: [100, 1001]})
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.taskset_calls(), ["taskset -pc 50 900", "taskset -pc 51 1009", "taskset -pc 52 2001", "taskset -pc 53 3005"])
+        self.assertIn("ACC_PIN role=r0 tid=900 cpu=50", run.stdout)
+        self.assertIn("ACC_PIN_DONE role=r0 container=claude-flash-launch-glm53flash-r0-tcut pinned=4/4 cpus=50-53", run.stdout)
+
+    def test_three_threads_are_left_unpinned_and_the_boot_still_succeeds(self) -> None:
+        self.docker_state("absent")
+        self.threads({100: [101], 200: [201], 300: [301]})
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.taskset_calls(), [])
+        self.assertIn("ACC_PIN_WARN role=r0 found 3 AccThreadPool threads", run.stdout)
+        self.assertIn("ACC_PIN_INCOMPLETE", run.stdout)
+        self.assertTrue(self.wanted.exists())
+
+    def test_failed_pins_never_fail_the_boot(self) -> None:
+        self.docker_state("absent")
+        self.threads({100: [101], 200: [201], 300: [301], 400: [401]})
+        (self.state / "taskset-fails").touch()
+
+        run = self.boot()
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn("pinned=0/4", run.stdout)
+        self.assertIn("ACC_PIN_INCOMPLETE", run.stdout)
+
+    def test_boot_that_fails_pins_nothing(self) -> None:
+        self.docker_state("absent")
+        self.threads({100: [101], 200: [201], 300: [301], 400: [401]})
+        (self.state / "serve-fails").touch()
+
+        self.boot()
+
+        self.assertEqual(self.taskset_calls(), [])
+
+    def test_pin_acc_mode_pins_a_running_replica_without_starting_anything(self) -> None:
+        self.docker_state("running")
+        self.threads({100: [101], 200: [201], 300: [301], 400: [401]})
+
+        run = self.boot("--pin-acc")
+
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(len(self.taskset_calls()), 4)
+        self.assertEqual(self.serve_saw(), "never started")
+
+    def test_pin_acc_mode_on_a_stopped_replica_says_so_and_fails(self) -> None:
+        self.docker_state("stopped")
+
+        run = self.boot("--pin-acc")
+
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("is not running; nothing to pin", run.stdout)
+        self.assertEqual(self.taskset_calls(), [])
 
 
 if __name__ == "__main__":

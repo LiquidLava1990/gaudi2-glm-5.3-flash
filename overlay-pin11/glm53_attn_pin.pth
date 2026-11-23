@@ -1,0 +1,1 @@
+import glm53_attn_pin; glm53_attn_pin.install_from_env()
